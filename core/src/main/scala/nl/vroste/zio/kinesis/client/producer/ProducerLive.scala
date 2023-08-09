@@ -58,7 +58,7 @@ private[client] final class ProducerLive[R, R1, T](
           ZStream.scoped(ShardMap.md5.orDie).flatMap { digest =>
             if (aggregate)
               requests
-                .aggregateTimeouted(aggregator, aggregationTimeout)
+                .aggregateWithinDuration(aggregator, aggregationTimeout)
                 .mapConcatZIO(_.toProduceRequest(digest).map(_.toList))
             else requests
           }
@@ -70,7 +70,7 @@ private[client] final class ProducerLive[R, R1, T](
         chunkBufferSize
       )                   // TODO can we avoid this second group by?
       // Batch records up to the Kinesis PutRecords request limits as long as downstream is busy
-      .aggregateTimeouted(batcher, batchingTimeout)
+      .aggregateWithinDuration(batcher, batchingTimeout)
       .filter(_.nonEmpty) // TODO why would this be necessary?
       // Several putRecords requests in parallel
       .flatMapPar(settings.maxParallelRequests, chunkBufferSize)(b => ZStream.fromZIO(countInFlight(processBatch(b))))

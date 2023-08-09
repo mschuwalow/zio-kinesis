@@ -16,7 +16,7 @@ object Util {
     def terminateOnPromiseCompleted[E1 >: E](p: Promise[Nothing, _]): ZStream[R, E1, O] =
       stream.map(Exit.succeed).mergeHaltEither(ZStream.fromZIO(p.await).as(Exit.fail(None))).flattenExitOption
 
-    def aggregateTimeouted[R1 <: R, E1 >: E, A >: O, B](
+    def aggregateWithinDuration[R1 <: R, E1 >: E, A >: O, B](
       aggregator: ZSink[R1, E1, A, A, B],
       timeout: Option[Duration] = None
     ): ZStream[R1, E1, B] =
