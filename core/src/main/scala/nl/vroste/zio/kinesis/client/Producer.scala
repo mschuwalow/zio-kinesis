@@ -44,6 +44,8 @@ import java.time.Instant
  */
 trait Producer[T] {
 
+  def produceAsync(r: ProducerRecord[T]): Task[Task[ProduceResponse]]
+
   /**
    * Produce a single record
    *
@@ -53,7 +55,9 @@ trait Producer[T] {
    * @return
    *   Task that fails if the records fail to be produced with a non-recoverable error
    */
-  def produce(r: ProducerRecord[T]): Task[ProduceResponse]
+  final def produce(r: ProducerRecord[T]): Task[ProduceResponse] = produceAsync(r).flatten
+
+  def produceChunkAsync(chunk: Chunk[ProducerRecord[T]]): Task[Task[Chunk[ProduceResponse]]]
 
   /**
    * Backpressures when too many requests are in flight
@@ -61,7 +65,9 @@ trait Producer[T] {
    * @return
    *   Task that fails if any of the records fail to be produced with a non-recoverable error
    */
-  def produceChunk(chunk: Chunk[ProducerRecord[T]]): Task[Chunk[ProduceResponse]]
+  final def produceChunk(chunk: Chunk[ProducerRecord[T]]): Task[Chunk[ProduceResponse]] = produceChunkAsync(
+    chunk
+  ).flatten
 
   /**
    * ZSink interface to the Producer

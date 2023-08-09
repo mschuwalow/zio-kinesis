@@ -155,6 +155,16 @@ private[client] final class ProducerLive[R, R1, T](
       r                             <- checkShardPredictionErrors(responseAndRequests, m1)
       (hasShardPredictionErrors, m2) = r
       m3                            <- handleFailures(newFailed, repredict = hasShardPredictionErrors, m2)
+      _                             <- currentMetrics.getAndUpdate(succeeded.foldLeft(_) { case (metrics, (_, request)) =>
+                                         if (request.isAggregated) {
+                                           metrics.addSuccesses(
+                                             Chunk.fill(request.aggregateCount)(request.attemptNumber),
+                                             Chunk.fill(request.aggregateCount)(java.time.Duration.between(request.timestamp, now))
+                                           )
+                                         } else {
+                                           metrics.addSuccess(request.attemptNumber, java.time.Duration.between(request.timestamp, now))
+                                         }
+                                       })
       _                             <- ZIO.foreachDiscard(succeeded) { case (response, request) =>
                                          request.complete(
                                            ZIO.succeed(
@@ -271,18 +281,15 @@ private[client] final class ProducerLive[R, R1, T](
     .delay(settings.metricsInterval)
     .repeat(Schedule.fixed(settings.metricsInterval))
 
-  override def produce(r: ProducerRecord[T]): Task[ProduceResponse] =
+  override def produceAsync(r: ProducerRecord[T]): Task[Task[ProduceResponse]] =
     (for {
       now             <- instant
       ar              <- makeProduceRequest(r, serializer, now)
       (await, request) = ar
       _               <- queue.offer(request)
-      response        <- await
-      latency          = java.time.Duration.between(now, response.completed)
-      _               <- currentMetrics.getAndUpdate(_.addSuccess(response.attempts, latency))
-    } yield response).provideEnvironment(env)
+    } yield await).provideEnvironment(env)
 
-  override def produceChunk(chunk: Chunk[ProducerRecord[T]]): Task[Chunk[ProduceResponse]] =
+  override def produceChunkAsync(chunk: Chunk[ProducerRecord[T]]): Task[Task[Chunk[ProduceResponse]]] =
     (for {
       now <- instant
 
@@ -306,11 +313,8 @@ private[client] final class ProducerLive[R, R1, T](
                              } yield (done.await, ProduceRequest(data, PartitionKey(r.partitionKey), onDone, now, null))
                            }
       _                 <- queue.offerAll(requests.map(_._2))
-      results           <- if (chunk.nonEmpty) done.await else ZIO.succeed(Chunk.empty)
-      latencies          = results.map(r => java.time.Duration.between(now, r.completed))
-      _                 <- currentMetrics.getAndUpdate(_.addSuccesses(results.map(_.attempts), latencies))
-    } yield results)
-      .provideEnvironment(env)
+      awaitResult        = if (chunk.nonEmpty) done.await else ZIO.succeed(Chunk.empty)
+    } yield awaitResult).provideEnvironment(env)
 }
 
 private[client] object ProducerLive {
