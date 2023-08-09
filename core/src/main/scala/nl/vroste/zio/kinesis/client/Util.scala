@@ -2,6 +2,7 @@ package nl.vroste.zio.kinesis.client
 
 import zio._
 import zio.stream.ZStream
+import zio.stream.ZSink
 
 object Util {
   implicit class ZStreamExtensions[-R, +E, +O](val stream: ZStream[R, E, O]) extends AnyVal {
@@ -14,6 +15,14 @@ object Util {
 
     def terminateOnPromiseCompleted[E1 >: E](p: Promise[Nothing, _]): ZStream[R, E1, O] =
       stream.map(Exit.succeed).mergeHaltEither(ZStream.fromZIO(p.await).as(Exit.fail(None))).flattenExitOption
+
+    def aggregateTimeouted[R1 <: R, E1 >: E, A >: O, B](
+      aggregator: ZSink[R1, E1, A, A, B],
+      timeout: Option[Duration] = None
+    ): ZStream[R1, E1, B] =
+      timeout.fold(stream.aggregateAsync(aggregator))(timeout =>
+        stream.aggregateAsyncWithin(aggregator, Schedule.spaced(timeout))
+      )
   }
 
   /**

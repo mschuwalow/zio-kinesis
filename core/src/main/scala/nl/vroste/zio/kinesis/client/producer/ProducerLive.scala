@@ -35,9 +35,12 @@ private[client] final class ProducerLive[R, R1, T](
   inFlightCalls: Ref[Int],
   triggerUpdateShards: UIO[Unit],
   throttler: ShardThrottler,
-  md5Pool: ZPool[Throwable, MessageDigest]
+  md5Pool: ZPool[Throwable, MessageDigest],
+  aggregationTimeout: Option[Duration] = None,
+  batchingTimeout: Option[Duration] = None
 ) extends Producer[T] {
   import ProducerLive._
+  import Util.ZStreamExtensions
 
   val runloop: ZIO[Any, Nothing, Unit] = {
     val retries         = ZStream.fromQueue(failedQueue, maxChunkSize = maxChunkSize)
@@ -54,7 +57,9 @@ private[client] final class ProducerLive[R, R1, T](
         { case (shardId @ _, requests) =>
           ZStream.scoped(ShardMap.md5.orDie).flatMap { digest =>
             if (aggregate)
-              requests.aggregateAsync(aggregator).mapConcatZIO(_.toProduceRequest(digest).map(_.toList))
+              requests
+                .aggregateTimeouted(aggregator, aggregationTimeout)
+                .mapConcatZIO(_.toProduceRequest(digest).map(_.toList))
             else requests
           }
         },
@@ -65,7 +70,7 @@ private[client] final class ProducerLive[R, R1, T](
         chunkBufferSize
       )                   // TODO can we avoid this second group by?
       // Batch records up to the Kinesis PutRecords request limits as long as downstream is busy
-      .aggregateAsync(batcher)
+      .aggregateTimeouted(batcher, batchingTimeout)
       .filter(_.nonEmpty) // TODO why would this be necessary?
       // Several putRecords requests in parallel
       .flatMapPar(settings.maxParallelRequests, chunkBufferSize)(b => ZStream.fromZIO(countInFlight(processBatch(b))))

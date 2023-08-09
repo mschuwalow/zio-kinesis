@@ -106,7 +106,9 @@ final case class ProducerSettings(
   updateShardInterval: Duration = 30.seconds,
   aggregate: Boolean = false,
   allowedErrorRate: Double = 0.05,
-  shardPredictionParallelism: Int = 8
+  shardPredictionParallelism: Int = 8,
+  aggregationTimeout: Option[Duration] = None,
+  batchingTimeout: Option[Duration] = None
 ) {
   require(allowedErrorRate > 0 && allowedErrorRate <= 1.0, "allowedErrorRate must be between 0 and 1 (inclusive)")
 }
@@ -174,7 +176,9 @@ object Producer {
                    inFlightCalls,
                    triggerUpdateShards,
                    throttler,
-                   md5Pool
+                   md5Pool,
+                   settings.aggregationTimeout,
+                   settings.batchingTimeout
                  )
       _       <- producer.runloop.forkScoped                                             // Fiber cannot fail
       _       <- producer.metricsCollection.ensuring(producer.collectMetrics).forkScoped // Fiber cannot fail
