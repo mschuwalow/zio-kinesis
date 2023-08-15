@@ -1,0 +1,344 @@
+package nl.vroste.zio.kinesis.client.producer
+
+import io.netty.handler.timeout.ReadTimeoutException
+import nl.vroste.zio.kinesis.client.Producer.ProduceResponse
+import nl.vroste.zio.kinesis.client._
+import nl.vroste.zio.kinesis.client.serde.Serializer
+import software.amazon.awssdk.core.exception.SdkException
+import software.amazon.awssdk.services.kinesis.model.{ KinesisException, ResourceInUseException }
+import zio.Clock.instant
+import zio._
+import zio.aws.kinesis.Kinesis
+import zio.aws.kinesis.model.primitives.{ PartitionKey, StreamName }
+import zio.aws.kinesis.model.{ PutRecordsRequest, PutRecordsRequestEntry, PutRecordsResponse, PutRecordsResultEntry }
+import zio.stream.{ ZChannel, ZSink, ZStream }
+
+import java.io.IOException
+import java.nio.charset.StandardCharsets
+import java.security.MessageDigest
+import java.time.Instant
+import scala.util.control.NonFatal
+import SimpleProducerLive.ProduceRequest
+
+private[client] final class SimpleProducerLive[R, R1, T](
+  client: Kinesis,
+  env: ZEnvironment[R],
+  queue: Queue[ProduceRequest],
+  failedQueue: Queue[ProduceRequest],
+  serializer: Serializer[R, T],
+  currentMetrics: Ref[CurrentMetrics],
+  settings: ProducerSettings,
+  streamName: StreamName,
+  metricsCollector: ProducerMetrics => ZIO[R1, Nothing, Unit],
+  inFlightCalls: Ref[Int],
+  batchingTimeout: Option[Duration] = None
+) extends Producer[T] {
+  import SimpleProducerLive._
+  import Util.ZStreamExtensions
+
+  val runloop: ZIO[Any, Nothing, Unit] = {
+    val retries         = ZStream.fromQueue(failedQueue, maxChunkSize = maxChunkSize)
+    val chunkBufferSize = Math.ceil(settings.bufferSize * 1.0 / maxChunkSize).toInt
+
+    val dequeue = ZStream
+      .fromQueue(queue, maxChunkSize)
+      .mapChunksZIO(chunk => ZIO.logTrace(s"Dequeued chunk of size ${chunk.size}").as(Chunk.single(chunk)))
+      .flattenChunks
+
+    // Failed records get precedence
+    retries
+      .merge(dequeue)
+      // Batch records up to the Kinesis PutRecords request limits as long as downstream is busy
+      .aggregateWithinDuration(batcher, batchingTimeout)
+      .filter(_.nonEmpty) // TODO why would this be necessary?
+      // Several putRecords requests in parallel
+      .flatMapPar(settings.maxParallelRequests, chunkBufferSize)(b => ZStream.fromZIO(countInFlight(processBatch(b))))
+      .collect { case (Some(response), requests) => (response, requests) }
+      .mapZIO((processBatchResponse _).tupled)
+      .tap(metrics => currentMetrics.update(_ append metrics))
+      .runDrain
+  }
+
+  private def processBatch(
+    batch: Chunk[ProduceRequest]
+  ): ZIO[Any, Nothing, (Option[PutRecordsResponse.ReadOnly], Chunk[ProduceRequest])] = {
+    val totalPayload = batch.map(_.data.length).sum
+    (for {
+      _        <- ZIO.logInfo(
+                    s"PutRecords for batch of size ${batch.size}. " +
+//               s"Payload sizes: ${batch.map(_.data.asByteArrayUnsafe().length).mkString(",")} " +
+                      s"(total = ${totalPayload} = ${totalPayload * 100.0 / maxPayloadSizePerRequest}%)."
+                  )
+
+      // Avoid an allocation
+      response <- client
+                    .putRecords(new PutRecordsRequest(batch.map(_.asPutRecordsRequestEntry), streamName))
+                    .mapError(_.toThrowable)
+                    .tapError(e => ZIO.logWarning(s"Error producing records, will retry if recoverable: $e"))
+                    .retry(scheduleCatchRecoverable && settings.backoffRequests)
+    } yield (Some(response), batch)).catchSome { case NonFatal(e) =>
+      ZIO.logWarning("Failed to process batch") *>
+        ZIO.foreachDiscard(batch)(_.complete(ZIO.fail(e))).as((None, batch))
+    }.orDie
+  }
+
+  private def processBatchResponse(
+    response: PutRecordsResponse.ReadOnly,
+    batch: Chunk[ProduceRequest]
+  ): ZIO[Any, Nothing, CurrentMetrics] = {
+    val totalPayload = batch.map(_.data.length).sum
+
+    val responseAndRequests    = Chunk.fromIterable(response.records).zip(batch)
+    val (newFailed, succeeded) =
+      if (response.failedRecordCount.getOrElse(0) > 0)
+        responseAndRequests.partition { case (result, _) =>
+          result.errorCode.exists(recoverableErrorCodes.contains)
+        }
+      else
+        (Chunk.empty, responseAndRequests)
+    for {
+
+      now <- instant
+      m1   = CurrentMetrics.empty(now).addPayloadSize(totalPayload).addRecordSizes(batch.map(_.payloadSize))
+      m2  <- handleFailures(newFailed, m1)
+      _   <- currentMetrics.getAndUpdate(succeeded.foldLeft(_) { case (metrics, (_, request)) =>
+               metrics.addSuccess(request.attemptNumber, java.time.Duration.between(request.timestamp, now))
+             })
+      _   <- ZIO.foreachDiscard(succeeded) { case (response, request) =>
+               request.complete(
+                 ZIO.succeed(
+                   ProduceResponse(
+                     response.shardId.toOption.get,
+                     response.sequenceNumber.toOption.get,
+                     request.attemptNumber,
+                     completed = now
+                   )
+                 )
+               )
+             }
+      // TODO handle connection failure
+    } yield m2
+  }
+
+  private def handleFailures(
+    newFailed: Chunk[(PutRecordsResultEntry.ReadOnly, ProduceRequest)],
+    metrics: CurrentMetrics
+  ) = {
+    val requests    = newFailed.map(_._2)
+    val responses   = newFailed.map(_._1)
+    val failedCount = requests.size
+
+    for {
+      _ <- ZIO.logWarning(s"Failed to produce ${failedCount} records").when(newFailed.nonEmpty)
+      _ <- ZIO.logWarning(responses.take(10).flatMap(_.errorCode.toOption).mkString(", ")).when(newFailed.nonEmpty)
+
+      // The shard map may not yet be updated unless we're experiencing high latency
+      updatedFailed = requests.map(_.newAttempt)
+
+      // TODO backoff for shard limit stuff
+      _ <- failedQueue
+             .offerAll(updatedFailed)
+             .when(newFailed.nonEmpty)
+    } yield metrics.addFailures(failedCount)
+  }
+
+  private def countInFlight[R0, E, A](e: ZIO[R0, E, A]): ZIO[R0, E, A] =
+    ZIO.acquireReleaseWith(
+      inFlightCalls
+        .updateAndGet(_ + 1)
+        .tap(inFlightCalls => ZIO.logDebug(s"${inFlightCalls} PutRecords calls in flight"))
+    )(_ =>
+      inFlightCalls
+        .updateAndGet(_ - 1)
+        .tap(inFlightCalls => ZIO.logDebug(s"${inFlightCalls} PutRecords calls in flight"))
+    )(_ => e)
+
+  val collectMetrics: ZIO[R1, Nothing, Unit] = for {
+    now    <- instant
+    m      <- currentMetrics.getAndUpdate(_ => CurrentMetrics.empty(now))
+    metrics = ProducerMetrics(
+                java.time.Duration.between(m.start, now),
+                m.publishedHist,
+                m.nrFailed,
+                m.latencyHist,
+                m.shardPredictionErrors,
+                m.payloadSizeHist,
+                m.recordSizeHist
+              )
+    _      <- metricsCollector(metrics)
+  } yield ()
+
+  // Repeatedly produce metrics
+  val metricsCollection: ZIO[R1, Nothing, Long] = collectMetrics
+    .delay(settings.metricsInterval)
+    .repeat(Schedule.fixed(settings.metricsInterval))
+
+  override def produceAsync(r: ProducerRecord[T]): Task[Task[ProduceResponse]] =
+    (for {
+      now             <- instant
+      ar              <- makeProduceRequest(r, serializer, now)
+      (await, request) = ar
+      _               <- queue.offer(request)
+    } yield await).provideEnvironment(env)
+
+  override def produceChunkAsync(chunk: Chunk[ProducerRecord[T]]): Task[Task[Chunk[ProduceResponse]]] =
+    (for {
+      now <- instant
+
+      done              <- Promise.make[Throwable, Chunk[ProduceResponse]]
+      resultsCollection <- Ref.make[Chunk[ProduceResponse]](Chunk.empty)
+      nrRequests         = chunk.size
+      onDone             = (response: Task[ProduceResponse]) =>
+                             response
+                               .foldZIO(
+                                 done.fail,
+                                 response =>
+                                   for {
+                                     responses <- resultsCollection.updateAndGet(_ :+ response)
+                                     _         <- ZIO.when(responses.size == nrRequests)(done.succeed(responses))
+                                   } yield ()
+                               )
+                               .unit
+      requests          <- ZIO.foreach(chunk) { r =>
+                             for {
+                               data <- serializer.serialize(r.data)
+                             } yield (done.await, ProduceRequest(data, PartitionKey(r.partitionKey), onDone, now))
+                           }
+      _                 <- queue.offerAll(requests.map(_._2))
+      awaitResult        = if (chunk.nonEmpty) done.await else ZIO.succeed(Chunk.empty)
+    } yield awaitResult).provideEnvironment(env)
+}
+
+private[client] object SimpleProducerLive {
+  type ShardId = String
+
+  val maxChunkSize: Int        = 1024            // Stream-internal max chunk size
+  val maxRecordsPerRequest     = 500             // This is a Kinesis API limitation
+  val maxPayloadSizePerRequest = 5 * 1024 * 1024 // 5 MB
+  val maxPayloadSizePerRecord  =
+    1 * 1024 * 921 // 1 MB TODO actually 90%, to avoid underestimating and getting Kinesis errors
+  val maxIngestionPerShardPerSecond = 1 * 1024 * 1024 // 1 MB
+  val maxRecordsPerShardPerSecond   = 1000
+
+  val recoverableErrorCodes = Set("ProvisionedThroughputExceededException", "InternalFailure", "ServiceUnavailable")
+
+  final case class ProduceRequest(
+    data: Chunk[Byte],
+    partitionKey: PartitionKey,
+    complete: ZIO[Any, Throwable, ProduceResponse] => UIO[Unit],
+    timestamp: Instant,
+    attemptNumber: Int = 1
+  ) {
+    def newAttempt = copy(attemptNumber = attemptNumber + 1)
+
+    def isRetry: Boolean = attemptNumber > 1
+
+    def payloadSize: Int = data.length + partitionKey.getBytes(StandardCharsets.UTF_8).length
+
+    def asPutRecordsRequestEntry: PutRecordsRequestEntry =
+      PutRecordsRequestEntry(zio.aws.kinesis.model.primitives.Data.apply(data), partitionKey = partitionKey)
+  }
+
+  final case class PutRecordsBatch(entries: Chunk[ProduceRequest], nrRecords: Int, payloadSize: Long) {
+    def add(entry: ProduceRequest): PutRecordsBatch =
+      copy(
+        entries = entries :+ entry,
+        nrRecords = nrRecords + 1,
+        payloadSize = payloadSize + payloadSizeForEntry(entry.data, entry.partitionKey)
+      )
+
+    def isWithinLimits =
+      nrRecords <= maxRecordsPerRequest &&
+        payloadSize <= maxPayloadSizePerRequest
+  }
+
+  object PutRecordsBatch {
+    val empty = PutRecordsBatch(Chunk.empty, 0, 0)
+  }
+
+  def makeProduceRequest[R, T](
+    r: ProducerRecord[T],
+    serializer: Serializer[R, T],
+    now: Instant
+  ): ZIO[R, Throwable, (ZIO[Any, Throwable, ProduceResponse], ProduceRequest)] =
+    for {
+      done <- Promise.make[Throwable, ProduceResponse]
+      data <- serializer.serialize(r.data)
+    } yield (
+      done.await,
+      ProduceRequest(data, PartitionKey(r.partitionKey), done.completeWith(_).unit, now)
+    )
+
+  final def scheduleCatchRecoverable: Schedule[Any, Throwable, Throwable] =
+    Schedule.recurWhile(isRecoverableException)
+
+  private def isRecoverableException(e: Throwable): Boolean =
+    e match {
+      case e: KinesisException if e.statusCode() / 100 != 4 => true
+      case _: ReadTimeoutException                          => true
+      case _: IOException                                   => true
+      case _: ResourceInUseException                        =>
+        true // Also covers DELETING, but will result in ResourceNotFoundException on a subsequent attempt
+      case e: SdkException if Option(e.getCause).isDefined  => isRecoverableException(e.getCause)
+      case _                                                => false
+    }
+
+  def payloadSizeForEntry(entry: PutRecordsRequestEntry): Int =
+    payloadSizeForEntry(entry.data, entry.partitionKey)
+
+  def payloadSizeForEntry(data: Chunk[Byte], partitionKey: String): Int =
+    partitionKey.getBytes(StandardCharsets.UTF_8).length + data.length
+
+  def payloadSizeForEntryAggregated(entry: ProduceRequest): Int =
+    payloadSizeForEntry(entry.data, entry.partitionKey) +
+      3 +     // Data
+      3 + 2 + // Partition key
+      0       // entry.explicitHashKey.map(_.length + 2).getOrElse(1) + 3 // Explicit hash key
+
+  /**
+   * Like ZTransducer.foldM, but with 'while' instead of 'until' semantics regarding `contFn`
+   */
+  def foldWhile[Env, Err, In, S](z: => S)(contFn: S => Boolean)(
+    f: (S, In) => ZIO[Env, Err, S]
+  )(implicit trace: Trace): ZSink[Env, Err, In, In, S] =
+    ZSink.suspend {
+      def foldChunkSplitM(z: S, chunk: Chunk[In])(
+        contFn: S => Boolean
+      )(f: (S, In) => ZIO[Env, Err, S]): ZIO[Env, Err, (S, Option[Chunk[In]])] = {
+
+        def fold(s: S, chunk: Chunk[In], idx: Int, len: Int): ZIO[Env, Err, (S, Option[Chunk[In]])] =
+          if (idx == len) ZIO.succeed((s, None))
+          else
+            f(s, chunk(idx)).flatMap { s1 =>
+              if (contFn(s1))
+                fold(s1, chunk, idx + 1, len)
+              else
+                ZIO.succeed((s, Some(chunk.drop(idx))))
+            }
+
+        fold(z, chunk, 0, chunk.length)
+      }
+
+      def reader(s: S): ZChannel[Env, Err, Chunk[In], Any, Err, Chunk[In], S] =
+        if (!contFn(s)) ZChannel.succeedNow(s)
+        else
+          ZChannel.readWith(
+            (in: Chunk[In]) =>
+              ZChannel.fromZIO(foldChunkSplitM(s, in)(contFn)(f)).flatMap { case (nextS, leftovers) =>
+                leftovers match {
+                  case Some(l) => ZChannel.write(l).as(nextS)
+                  case None    => reader(nextS)
+                }
+              },
+            (err: Err) => ZChannel.fail(err),
+            (_: Any) => ZChannel.succeedNow(s)
+          )
+
+      ZSink.fromChannel(reader(z))
+    }
+
+  val batcher: ZSink[Any, Nothing, ProduceRequest, ProduceRequest, Chunk[ProduceRequest]] =
+    foldWhile(PutRecordsBatch.empty)(_.isWithinLimits) { (batch, record: ProduceRequest) =>
+      ZIO.succeed(batch.add(record))
+    }.map(_.entries)
+}

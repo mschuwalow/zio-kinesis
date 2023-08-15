@@ -190,6 +190,42 @@ object Producer {
       _       <- producer.metricsCollection.ensuring(producer.collectMetrics).forkScoped // Fiber cannot fail
     } yield producer
 
+  def simple[R, R1, T](
+    streamName: String,
+    serializer: Serializer[R, T],
+    settings: ProducerSettings = ProducerSettings(),
+    metricsCollector: ProducerMetrics => ZIO[R1, Nothing, Unit] = (_: ProducerMetrics) => ZIO.unit
+  ): ZIO[Scope with R with R1 with Kinesis, Throwable, Producer[T]] = {
+    import SimpleProducerLive.ProduceRequest
+
+    for {
+      client         <- ZIO.service[Kinesis]
+      env            <- ZIO.environment[R]
+      queue          <- ZIO.acquireRelease(Queue.bounded[ProduceRequest](settings.bufferSize))(_.shutdown)
+      currentMetrics <- instant.map(CurrentMetrics.empty).flatMap(Ref.make(_))
+      inFlightCalls  <- Ref.make(0)
+      failedQueue    <- ZIO.acquireRelease(Queue.bounded[ProduceRequest](settings.bufferSize))(_.shutdown)
+
+      md5Pool <- ZPool.make(ShardMap.md5, settings.shardPredictionParallelism + settings.maxParallelRequests)
+
+      producer = new SimpleProducerLive[R, R1, T](
+                   client,
+                   env,
+                   queue,
+                   failedQueue,
+                   serializer,
+                   currentMetrics,
+                   settings,
+                   StreamName(streamName),
+                   metricsCollector,
+                   inFlightCalls,
+                   settings.batchingTimeout
+                 )
+      _       <- producer.runloop.forkScoped                                             // Fiber cannot fail
+      _       <- producer.metricsCollection.ensuring(producer.collectMetrics).forkScoped // Fiber cannot fail
+    } yield producer
+  }
+
   private def getShardMap(streamName: StreamName): ZIO[Kinesis, Throwable, ShardMap] = {
     val shardFilter = ShardFilter(ShardFilterType.AT_LATEST) // Currently open shards
     Kinesis
