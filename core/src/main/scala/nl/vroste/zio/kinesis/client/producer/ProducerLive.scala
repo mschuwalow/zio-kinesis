@@ -55,13 +55,13 @@ private[client] final class ProducerLive[R, R1, T](
       // Aggregate records per shard
       .groupByKey(_.predictedShard, chunkBufferSize)(
         { case (shardId @ _, requests) =>
-          ZStream.scoped(ShardMap.md5.orDie).flatMap { digest =>
-            if (aggregate)
+          if (aggregate)
+            ZStream.scoped(ShardMap.md5.orDie).flatMap { digest =>
               requests
                 .aggregateWithinDuration(aggregator, aggregationTimeout)
                 .mapConcatZIO(_.toProduceRequest(digest).map(_.toList))
-            else requests
-          }
+            }
+          else requests
         },
         chunkBufferSize
       ))
