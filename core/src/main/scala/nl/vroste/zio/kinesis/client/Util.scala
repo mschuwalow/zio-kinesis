@@ -7,6 +7,11 @@ import zio.stream.ZSink
 object Util {
   implicit class ZStreamExtensions[-R, +E, +O](val stream: ZStream[R, E, O]) extends AnyVal {
 
+    def viaIf[R1 <: R, E1 >: E, O1 >: O](condition: Boolean)(
+      f: ZStream[R, E, O] => ZStream[R1, E1, O1]
+    ): ZStream[R1, E1, O1] =
+      if (condition) f(stream) else stream
+
     def terminateOnFiberFailure[E1 >: E](fib: Fiber[E1, Any]): ZStream[R, E1, O] =
       stream
         .map(Exit.succeed)

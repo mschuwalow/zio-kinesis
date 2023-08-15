@@ -52,19 +52,19 @@ private[client] final class ProducerLive[R, R1, T](
       .mapChunksZIO(chunk => ZIO.logTrace(s"Dequeued chunk of size ${chunk.size}").as(Chunk.single(chunk)))
       .mapZIOParUnordered(settings.shardPredictionParallelism)(addPredictedShardToRequestsChunk)
       .flattenChunks
-      // Aggregate records per shard
-      .groupByKey(_.predictedShard, chunkBufferSize)(
-        { case (shardId @ _, requests) =>
-          if (aggregate)
+      .viaIf(aggregate) {
+        // Aggregate records per shard
+        _.groupByKey(_.predictedShard, chunkBufferSize)(
+          { case (shardId @ _, requests) =>
             ZStream.scoped(ShardMap.md5.orDie).flatMap { digest =>
               requests
                 .aggregateWithinDuration(aggregator, aggregationTimeout)
                 .mapConcatZIO(_.toProduceRequest(digest).map(_.toList))
             }
-          else requests
-        },
-        chunkBufferSize
-      ))
+          },
+          chunkBufferSize
+        )
+      })
       .groupByKey(_.predictedShard, chunkBufferSize)(
         throttleShardRequests,
         chunkBufferSize
